@@ -1,0 +1,28 @@
+[package]
+name = "wtun"
+version = "0.6.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "macros",
+    "signal",
+    "sync",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "ansi",
+] }
+wtransport = { version = "0.7", features = ["dangerous-configuration"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
