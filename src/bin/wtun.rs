@@ -109,10 +109,10 @@ fn parse_args() -> Result<Args, String> {
 fn extract_token_from_path(path: &str) -> Option<String> {
     let query = path.split_once('?')?.1;
     for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == "token" {
-                return Some(v.to_string());
-            }
+        if let Some((k, v)) = pair.split_once('=')
+            && k == "token"
+        {
+            return Some(v.to_string());
         }
     }
     None
@@ -217,7 +217,7 @@ async fn connect(
     }
 }
 
-fn parse_proxies(values: &Vec<String>) -> Result<Vec<Proxy>, String> {
+fn parse_proxies(values: &[String]) -> Result<Vec<Proxy>, String> {
     values
         .iter()
         .map(|s| {
@@ -249,7 +249,7 @@ fn parse_proxies(values: &Vec<String>) -> Result<Vec<Proxy>, String> {
                     return Err(format!("proxy name '{}' exceeds 8 characters", name));
                 }
                 let mut chars = name.chars();
-                let valid = chars.next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+                let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
                 if !valid {
                     return Err(format!("proxy name '{}' is invalid: must start with a letter or '_', and contain only letters, digits, or '_'", name));
                 }

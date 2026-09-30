@@ -10,7 +10,8 @@ use tracing::{debug, info, warn};
 use crate::{ConnSet, RecvStream, SendStream};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const TUNNEL_RETRY_COUNT: usize = 3;
+/// Retry up to 5 seconds total to allow the tunnel client to reconnect.
+const TUNNEL_RETRY_COUNT: usize = 25;
 const TUNNEL_RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
 async fn stream_copy(mut tx: SendStream, mut rx: RecvStream, conn: TcpStream) {

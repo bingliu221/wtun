@@ -15,6 +15,9 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{ConnSet, RecvStream, SendStream};
 
+/// Idle timeout for a per-client UDP session on the server side.
+const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, Copy)]
 pub struct PacketParseError;
 
@@ -28,19 +31,38 @@ impl Packet {
         Self { addr, payload: payload.to_vec() }
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
+    /// Returns an unspecified local [`SocketAddr`] of the same IP family as `target`,
+    /// suitable for binding a UDP socket that will communicate with `target`.
+    pub fn local_bind_addr(target: &SocketAddr) -> SocketAddr {
+        if target.is_ipv4() {
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into()
+        } else {
+            SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into()
+        }
+    }
+
+    /// Encode this packet into a length-prefixed wire frame using a single allocation.
+    ///
+    /// Wire format:
+    /// ```text
+    /// [ u16 data_len ][ u8 family (4|6) ][ 4|16 bytes ip ][ u16 port ][ payload ]
+    /// ```
+    pub fn into_framed(self) -> Vec<u8> {
+        let ip_len = if self.addr.is_ipv4() { 1 + 4 } else { 1 + 16 };
+        let data_len = ip_len + 2 + self.payload.len(); // ip + port (2 bytes) + payload
+        let mut buf = Vec::with_capacity(2 + data_len);
+        buf.extend_from_slice(&(data_len as u16).to_be_bytes()); // length prefix
         match self.addr.ip() {
             IpAddr::V4(ip) => {
                 buf.push(4);
-                buf.extend(ip.octets());
+                buf.extend_from_slice(&ip.octets());
             }
             IpAddr::V6(ip) => {
                 buf.push(6);
-                buf.extend(ip.octets());
+                buf.extend_from_slice(&ip.octets());
             }
         }
-        buf.extend(self.addr.port().to_be_bytes());
+        buf.extend_from_slice(&self.addr.port().to_be_bytes());
         buf.extend_from_slice(&self.payload);
         buf
     }
@@ -84,18 +106,6 @@ async fn recv_packet(rx: &mut RecvStream) -> Result<Option<Packet>, std::io::Err
     }
 }
 
-fn zero_addr(target: &SocketAddr) -> SocketAddr {
-    if target.is_ipv4() { SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into() } else { SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into() }
-}
-
-fn frame_packet(pkt: Packet) -> Vec<u8> {
-    let bytes = pkt.to_bytes();
-    let mut framed = Vec::with_capacity(2 + bytes.len());
-    framed.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-    framed.extend(bytes);
-    framed
-}
-
 async fn handle_target_stream(mut tx: SendStream, mut rx: RecvStream, target: SocketAddr) {
     info!(%target, "target stream started");
     let sockets = Arc::new(Mutex::new(HashMap::<SocketAddr, Arc<UdpSocket>>::new()));
@@ -116,7 +126,7 @@ async fn handle_target_stream(mut tx: SendStream, mut rx: RecvStream, target: So
             if let Some(sock) = map.get(&pkt.addr) {
                 sock.clone()
             } else {
-                let laddr = zero_addr(&target);
+                let laddr = Packet::local_bind_addr(&target);
                 let sock = Arc::new(UdpSocket::bind(laddr).await.unwrap());
                 info!(client = %pkt.addr, local = ?sock.local_addr().ok(), %target, "new UDP session");
                 map.insert(pkt.addr, sock.clone());
@@ -129,21 +139,21 @@ async fn handle_target_stream(mut tx: SendStream, mut rx: RecvStream, target: So
                     async move {
                         let mut buf = [0u8; 65536];
                         loop {
-                            match timeout(Duration::from_secs(10), socket.recv_from(&mut buf)).await {
+                            match timeout(UDP_SESSION_IDLE_TIMEOUT, socket.recv_from(&mut buf)).await {
                                 Ok(Ok((n, remote))) => {
                                     if remote != target {
                                         trace!(client = %addr, %remote, %target, "← ignored: packet not from target");
                                         continue;
                                     }
                                     trace!(client = %addr, payload_len = n, "← target: forwarding packet to tunnel");
-                                    let _ = write_tx.send(frame_packet(Packet::new(addr, &buf[..n])));
+                                    let _ = write_tx.send(Packet::new(addr, &buf[..n]).into_framed());
                                 }
                                 Ok(Err(e)) => {
                                     warn!(client = %addr, error = %e, "UDP recv_from error");
                                     break;
                                 }
                                 Err(_) => {
-                                    debug!(client = %addr, "UDP session timed out (10s idle)");
+                                    debug!(client = %addr, idle_secs = UDP_SESSION_IDLE_TIMEOUT.as_secs(), "UDP session timed out (idle)");
                                     break;
                                 }
                             }
@@ -209,7 +219,7 @@ pub async fn handle_entry(conns: ConnSet, entry: String, name: String) -> Result
                     let mut buf = [0u8; 65536];
                     while let Ok((n, addr)) = socket.recv_from(&mut buf).await {
                         trace!(src = %addr, payload_len = n, "→ tunnel: received packet from local");
-                        let data = frame_packet(Packet::new(addr, &buf[..n]));
+                        let data = Packet::new(addr, &buf[..n]).into_framed();
                         if let Err(e) = tx.write_all(&data).await {
                             warn!(src = %addr, error = %e, "failed to write to tunnel");
                             break;
