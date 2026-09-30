@@ -5,12 +5,20 @@ use tracing::{Level, debug, info, warn};
 use wtransport::{ClientConfig, Endpoint, Identity, ServerConfig};
 use wtun::{ConnSet, Proxy, tcp, udp};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct Args {
     serve: Option<String>,
     connect: Option<String>,
     target: Vec<String>,
     token: Option<String>,
+    timeout: Duration,
+    keep_alive: Duration,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self { serve: None, connect: None, target: Vec::new(), token: None, timeout: Duration::from_secs(10), keep_alive: Duration::from_secs(3) }
+    }
 }
 
 const HELP: &str = concat!(
@@ -20,17 +28,21 @@ const HELP: &str = concat!(
 Usage: wtun [OPTIONS]
 
 Options:
-  -S, --serve <ADDR>    Serve as wtun server, listen for incoming connections
-  -C, --connect <ADDR>  Connect to a wtun server, maintain connection
-  -P, --proxy <SPEC>    Proxy description (repeatable), format: [name@]host:port[/tcp|udp]
-  -K, --token <TOKEN>   Shared secret key for authentication
-  -h, --help            Print help
-  -V, --version         Print version"
+  -S, --serve <ADDR>        Serve as wtun server, listen for incoming connections
+  -C, --connect <ADDR>      Connect to a wtun server, maintain connection
+  -P, --proxy <SPEC>        Proxy description (repeatable), format: [name@]host:port[/tcp|udp]
+  -K, --token <TOKEN>       Shared secret key for authentication
+  -T, --timeout <SECS>      WebTransport idle timeout in seconds (default: 10)
+      --keep-alive <SECS>   WebTransport keep-alive interval in seconds (default: 3)
+  -h, --help                Print help
+  -V, --version             Print version"
 );
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args::default();
     let mut iter = std::env::args().skip(1);
+    let mut timeout_arg: Option<u64> = None;
+    let mut keep_alive_arg: Option<u64> = None;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -45,6 +57,22 @@ fn parse_args() -> Result<Args, String> {
             }
             "-K" | "--token" => {
                 args.token = Some(iter.next().ok_or("missing argument for --token")?);
+            }
+            "-T" | "--timeout" => {
+                let s = iter.next().ok_or("missing argument for --timeout")?;
+                let secs: u64 = s.parse().map_err(|_| format!("invalid timeout value: {s}"))?;
+                if secs == 0 {
+                    return Err("timeout must be greater than 0".into());
+                }
+                timeout_arg = Some(secs);
+            }
+            "--keep-alive" => {
+                let s = iter.next().ok_or("missing argument for --keep-alive")?;
+                let secs: u64 = s.parse().map_err(|_| format!("invalid keep-alive value: {s}"))?;
+                if secs == 0 {
+                    return Err("keep-alive must be greater than 0".into());
+                }
+                keep_alive_arg = Some(secs);
             }
             "-h" | "--help" => {
                 println!("{HELP}");
@@ -65,6 +93,16 @@ fn parse_args() -> Result<Args, String> {
         return Err("conflict args `serve` and `connect`".into());
     }
 
+    let timeout_secs = timeout_arg.unwrap_or(10);
+    let keep_alive_secs = keep_alive_arg.unwrap_or_else(|| if timeout_secs <= 3 { (timeout_secs / 2).max(1) } else { 3 });
+
+    if keep_alive_secs >= timeout_secs {
+        return Err("keep-alive must be less than timeout".into());
+    }
+
+    args.timeout = Duration::from_secs(timeout_secs);
+    args.keep_alive = Duration::from_secs(keep_alive_secs);
+
     Ok(args)
 }
 
@@ -80,13 +118,24 @@ fn extract_token_from_path(path: &str) -> Option<String> {
     None
 }
 
-async fn host(conns: ConnSet, addr: String, token: Option<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn host(
+    conns: ConnSet,
+    addr: String,
+    token: Option<String>,
+    timeout: Duration,
+    keep_alive: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sock_addr: SocketAddr = match addr.parse() {
         Ok(sa) => sa,
         Err(_) => tokio::net::lookup_host(&addr).await?.next().ok_or_else(|| format!("failed to resolve address: {}", addr))?,
     };
     let identity = Identity::self_signed(["localhost", "127.0.0.1"])?;
-    let config = ServerConfig::builder().with_bind_address(sock_addr).with_identity(identity).keep_alive_interval(Some(Duration::from_secs(3))).build();
+    let config = ServerConfig::builder()
+        .with_bind_address(sock_addr)
+        .with_identity(identity)
+        .keep_alive_interval(Some(keep_alive))
+        .max_idle_timeout(Some(timeout))?
+        .build();
 
     let server = Endpoint::server(config)?;
     info!(addr = %sock_addr, "WebTransport server listening");
@@ -125,8 +174,15 @@ async fn host(conns: ConnSet, addr: String, token: Option<String>) -> Result<(),
     }
 }
 
-async fn connect(conns: ConnSet, addr: String, token: Option<String>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client_config = ClientConfig::builder().with_bind_default().with_no_cert_validation().build();
+async fn connect(
+    conns: ConnSet,
+    addr: String,
+    token: Option<String>,
+    timeout: Duration,
+    keep_alive: Duration,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let client_config =
+        ClientConfig::builder().with_bind_default().with_no_cert_validation().keep_alive_interval(Some(keep_alive)).max_idle_timeout(Some(timeout))?.build();
 
     let endpoint = Endpoint::client(client_config)?;
 
@@ -146,16 +202,16 @@ async fn connect(conns: ConnSet, addr: String, token: Option<String>) -> Result<
                 conns.add(conn.clone()).await;
                 let _ = conn.closed().await;
                 conns.remove(&conn).await;
-                warn!(addr = %addr, "connection to host lost, reconnecting in 5s");
-                sleep(Duration::from_secs(5)).await;
+                warn!(addr = %addr, "connection to host lost, reconnecting in 1s");
+                sleep(Duration::from_secs(1)).await;
             }
             Err(e) => {
                 debug!(
                     addr = %addr,
                     error = %e,
-                    "failed to connect to host, retrying every 5 seconds"
+                    "failed to connect to host, retrying in 1s"
                 );
-                sleep(Duration::from_secs(5)).await;
+                sleep(Duration::from_secs(1)).await;
             }
         }
     }
@@ -239,8 +295,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host_handle = args.serve.map(|addr| {
         let token = args.token.clone();
         let conns = conns.clone();
+        let timeout = args.timeout;
+        let keep_alive = args.keep_alive;
         tokio::spawn(async move {
-            if let Err(e) = host(conns, addr, token).await {
+            if let Err(e) = host(conns, addr, token, timeout, keep_alive).await {
                 warn!(error = %e, "host exited with error");
             }
         })
@@ -249,8 +307,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client_handle = args.connect.map(|addr| {
         let token = args.token.clone();
         let conns = conns.clone();
+        let timeout = args.timeout;
+        let keep_alive = args.keep_alive;
         tokio::spawn(async move {
-            if let Err(e) = connect(conns, addr, token).await {
+            if let Err(e) = connect(conns, addr, token, timeout, keep_alive).await {
                 warn!(error = %e, "connect exited with error");
             }
         })
