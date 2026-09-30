@@ -15,157 +15,146 @@ env:
 
 jobs:
   build:
-    name: Build (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-22.04
-            arch: amd64
-            targets: "x86_64-unknown-linux-gnu:gnu x86_64-unknown-linux-musl:musl"
-            rust_targets: "x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl"
-          - runner: ubuntu-22.04-arm
-            arch: arm64
-            targets: "aarch64-unknown-linux-gnu:gnu aarch64-unknown-linux-musl:musl"
-            rust_targets: "aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl"
+    name: Build
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
+
+      - name: Set version
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Setup rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_targets }}
 
       - name: Cache rust
         uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.arch }}
 
-      - name: Install musl tools
-        run: sudo apt-get install -y musl-tools
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
       - name: Build and package
         run: |
           set -euo pipefail
-          mkdir -p dist artifacts
+          mkdir -p release artifacts
 
-          for item in ${{ matrix.targets }}; do
-            target="${item%%:*}"
-            libc="${item#*:}"
+          TARGETS=(
+            "x86_64-unknown-linux-gnu:amd64:gnu"
+            "x86_64-unknown-linux-musl:amd64:musl"
+            "aarch64-unknown-linux-gnu:arm64:gnu"
+            "aarch64-unknown-linux-musl:arm64:musl"
+            "armv7-unknown-linux-gnueabihf:armv7:gnu"
+            "armv7-unknown-linux-musleabihf:armv7:musl"
+            "riscv64gc-unknown-linux-gnu:riscv64:gnu"
+            "riscv64gc-unknown-linux-musl:riscv64:musl"
+          )
 
-            cargo build --release --target "$target"
+          for item in "${TARGETS[@]}"; do
+            IFS=':' read -r target arch libc <<< "$item"
+            echo "::group::Building $target ($arch, $libc)"
+
+            cross build --release --target "$target"
 
             bin="target/$target/release/${BIN_NAME}"
-            cp "$bin" "dist/${BIN_NAME}"
-            cp "$bin" "artifacts/${BIN_NAME}-${libc}"
-            tar -czf "${BIN_NAME}-${GITHUB_REF_NAME}-linux-${{ matrix.arch }}-${libc}.tar.gz" -C dist "${BIN_NAME}"
+            cp "$bin" "artifacts/${BIN_NAME}-${arch}-${libc}"
+            cp "$bin" "release/${BIN_NAME}-${VERSION}-linux-${arch}-${libc}"
+
+            echo "::endgroup::"
           done
 
       - name: Upload binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: bin-${{ matrix.arch }}
+          name: binaries
           path: artifacts/
           retention-days: 1
 
       - name: Publish release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          files: "*.tar.gz"
+          name: ${{ env.VERSION }}
+          files: release/*
 
   docker:
-    name: Docker (${{ matrix.arch }})
+    name: Docker
     needs: build
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - runner: ubuntu-22.04
-            platform: linux/amd64
-            arch: amd64
-          - runner: ubuntu-22.04-arm
-            platform: linux/arm64
-            arch: arm64
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
-          name: bin-${{ matrix.arch }}
+          name: binaries
+          path: artifacts
 
       - name: Prepare Docker context
         run: |
-          chmod +x ${BIN_NAME}-musl ${BIN_NAME}-gnu
+          chmod +x artifacts/*
 
           cat > Dockerfile.alpine <<'EOF'
           FROM alpine
+          ARG TARGETARCH
+          ARG TARGETVARIANT
           RUN apk add --no-cache ca-certificates
-          COPY wtun-musl /usr/local/bin/wtun
+          COPY artifacts/wtun-${TARGETARCH}${TARGETVARIANT}-musl /usr/local/bin/wtun
           ENTRYPOINT ["wtun"]
           EOF
 
           cat > Dockerfile.glibc <<'EOF'
-          FROM debian:bookworm-slim
+          FROM debian:trixie-slim
+          ARG TARGETARCH
+          ARG TARGETVARIANT
           RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-          COPY wtun-gnu /usr/local/bin/wtun
+          COPY artifacts/wtun-${TARGETARCH}${TARGETVARIANT}-gnu /usr/local/bin/wtun
           ENTRYPOINT ["wtun"]
           EOF
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Alpine image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.alpine
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/riscv64
           push: true
           provenance: false
-          tags: ${{ env.IMAGE }}:${{ github.ref_name }}-alpine-${{ matrix.arch }}
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}-alpine
+            ${{ env.IMAGE }}:latest-alpine
 
       - name: Build and push Glibc image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.glibc
-          platforms: ${{ matrix.platform }}
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/riscv64
           push: true
           provenance: false
-          tags: ${{ env.IMAGE }}:${{ github.ref_name }}-glibc-${{ matrix.arch }}
-
-  merge-docker:
-    name: Merge Docker Manifests
-    needs: docker
-    runs-on: ubuntu-22.04
-    steps:
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Merge Alpine manifest
-        run: |
-          docker buildx imagetools create \
-            --tag ${{ env.IMAGE }}:${{ github.ref_name }}-alpine \
-            --tag ${{ env.IMAGE }}:latest-alpine \
-            ${{ env.IMAGE }}:${{ github.ref_name }}-alpine-amd64 \
-            ${{ env.IMAGE }}:${{ github.ref_name }}-alpine-arm64
-
-      - name: Merge Glibc manifest
-        run: |
-          docker buildx imagetools create \
-            --tag ${{ env.IMAGE }}:${{ github.ref_name }} \
-            --tag ${{ env.IMAGE }}:${{ github.ref_name }}-glibc \
-            --tag ${{ env.IMAGE }}:latest \
-            ${{ env.IMAGE }}:${{ github.ref_name }}-glibc-amd64 \
-            ${{ env.IMAGE }}:${{ github.ref_name }}-glibc-arm64
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:${{ env.VERSION }}-glibc
+            ${{ env.IMAGE }}:latest
