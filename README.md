@@ -121,18 +121,17 @@ Logs are written to stderr.
 
 ## Docker
 
-Pre-built images are available for both musl (Alpine) and glibc (Debian) targets via the provided [Dockerfile](Dockerfile).
+Pre-built multi-arch images are available for both musl (Alpine) and glibc (Debian) targets via GitHub Packages (GHCR):
 
 ```sh
 # Alpine (musl, smaller image)
-docker build --target runtime-alpine -t wtun:alpine .
+docker run --rm ghcr.io/bingliu221/wtun:latest-alpine \
+    --serve 0.0.0.0:4433 \
+    --token mysecret \
+    --proxy db@db-host:5432/tcp
 
 # Debian (glibc)
-docker build --target runtime-glibc -t wtun:glibc .
-```
-
-```sh
-docker run --rm wtun:alpine \
+docker run --rm ghcr.io/bingliu221/wtun:latest \
     --serve 0.0.0.0:4433 \
     --token mysecret \
     --proxy db@db-host:5432/tcp

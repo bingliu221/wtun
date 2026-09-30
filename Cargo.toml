@@ -1,6 +1,6 @@
 [package]
 name = "wtun"
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 
 [dependencies]
@@ -21,7 +21,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 wtransport = { version = "0.7", features = ["dangerous-configuration"] }
 
 [profile.release]
-opt-level = "z"
+opt-level = "s"
 lto = true
 codegen-units = 1
 panic = "abort"
