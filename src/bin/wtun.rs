@@ -13,9 +13,10 @@ struct Args {
     token: Option<String>,
 }
 
-const HELP: &str = "\
-wtun 0.6.0
-
+const HELP: &str = concat!(
+    "wtun ",
+    env!("CARGO_PKG_VERSION"),
+    "\n\n\
 Usage: wtun [OPTIONS]
 
 Options:
@@ -24,7 +25,8 @@ Options:
   -P, --proxy <SPEC>    Proxy description (repeatable), format: [name@]host:port[/tcp|udp]
   -K, --token <TOKEN>   Shared secret key for authentication
   -h, --help            Print help
-  -V, --version         Print version";
+  -V, --version         Print version"
+);
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args::default();
