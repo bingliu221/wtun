@@ -1,7 +1,8 @@
 [package]
 name = "wtun"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
+description = "TCP/UDP tunnel over WebTransport"
 
 [dependencies]
 tokio = { version = "1", features = [
@@ -21,7 +22,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 wtransport = { version = "0.7", features = ["dangerous-configuration"] }
 
 [profile.release]
-opt-level = "s"
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"

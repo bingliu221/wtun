@@ -1,9 +1,13 @@
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
-use tokio::time::sleep;
+use tokio::{task::JoinSet, time::sleep};
 use tracing::{Level, debug, info, warn};
 use wtransport::{ClientConfig, Endpoint, Identity, ServerConfig};
-use wtun::{ConnSet, Proxy, tcp, udp};
+use wtun::{
+    ConnSet, Proxy, StreamAcceptor, parse_proxies, tcp,
+    token::{ct_eq, extract_token_from_path, percent_encode},
+    udp,
+};
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -106,25 +110,19 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
-fn extract_token_from_path(path: &str) -> Option<String> {
-    let query = path.split_once('?')?.1;
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=')
-            && k == "token"
-        {
-            return Some(v.to_string());
-        }
-    }
-    None
-}
 
-async fn host(
-    conns: ConnSet,
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Settings shared by the server (`host`) and client (`connect`) links.
+struct LinkConfig {
     addr: String,
     token: Option<String>,
     timeout: Duration,
     keep_alive: Duration,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+}
+
+async fn host(conns: ConnSet, cfg: LinkConfig) -> Result<(), BoxError> {
+    let LinkConfig { addr, token, timeout, keep_alive } = cfg;
     let sock_addr: SocketAddr = match addr.parse() {
         Ok(sa) => sa,
         Err(_) => tokio::net::lookup_host(&addr).await?.next().ok_or_else(|| format!("failed to resolve address: {}", addr))?,
@@ -140,6 +138,7 @@ async fn host(
     let server = Endpoint::server(config)?;
     info!(addr = %sock_addr, "WebTransport server listening");
 
+    let token: Option<Arc<str>> = token.map(Into::into);
     loop {
         let incoming_session = server.accept().await;
         let conns = conns.clone();
@@ -147,10 +146,10 @@ async fn host(
         tokio::spawn(async move {
             match incoming_session.await {
                 Ok(session_req) => {
-                    if let Some(ref expected) = token {
+                    if let Some(expected) = &token {
                         let path = session_req.path();
-                        let token_param = extract_token_from_path(path);
-                        if token_param.as_deref() != Some(expected.as_str()) {
+                        let authorized = extract_token_from_path(path).is_some_and(|got| ct_eq(got.as_bytes(), expected.as_bytes()));
+                        if !authorized {
                             warn!(path, "unauthorized WebTransport connection attempt");
                             session_req.forbidden().await;
                             return;
@@ -160,9 +159,9 @@ async fn host(
                     match session_req.accept().await {
                         Ok(conn) => {
                             info!("new WebTransport client connected");
-                            conns.add(conn.clone()).await;
+                            conns.add(conn.clone());
                             let _ = conn.closed().await;
-                            conns.remove(&conn).await;
+                            conns.remove(&conn);
                             info!("WebTransport client disconnected");
                         }
                         Err(e) => warn!(error = %e, "failed to accept WebTransport session"),
@@ -174,34 +173,29 @@ async fn host(
     }
 }
 
-async fn connect(
-    conns: ConnSet,
-    addr: String,
-    token: Option<String>,
-    timeout: Duration,
-    keep_alive: Duration,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn connect(conns: ConnSet, cfg: LinkConfig) -> Result<(), BoxError> {
+    let LinkConfig { addr, token, timeout, keep_alive } = cfg;
     let client_config =
         ClientConfig::builder().with_bind_default().with_no_cert_validation().keep_alive_interval(Some(keep_alive)).max_idle_timeout(Some(timeout))?.build();
 
     let endpoint = Endpoint::client(client_config)?;
 
     let mut url = if addr.starts_with("https://") { addr.clone() } else { format!("https://{}/wtun", addr) };
-    if let Some(ref t) = token {
+    if let Some(t) = &token {
         let separator = if url.contains('?') { '&' } else { '?' };
         url.push(separator);
-        url.push_str(&format!("token={}", t));
+        url.push_str(&format!("token={}", percent_encode(t)));
     }
 
     loop {
-        debug!(%url, "attempting to connect to host via WebTransport");
+        debug!(addr = %addr, "attempting to connect to host via WebTransport");
         match endpoint.connect(&url).await {
             Ok(conn) => {
                 info!(addr = %addr, "connected to host via WebTransport");
-                conns.clear().await;
-                conns.add(conn.clone()).await;
+                conns.clear();
+                conns.add(conn.clone());
                 let _ = conn.closed().await;
-                conns.remove(&conn).await;
+                conns.remove(&conn);
                 warn!(addr = %addr, "connection to host lost, reconnecting in 1s");
                 sleep(Duration::from_secs(1)).await;
             }
@@ -217,52 +211,11 @@ async fn connect(
     }
 }
 
-fn parse_proxies(values: &[String]) -> Result<Vec<Proxy>, String> {
-    values
-        .iter()
-        .map(|s| {
-            // [name@]host:port[/tcp|udp]
-            let (name_opt, rest) = match s.find('@') {
-                Some(i) => (Some(&s[..i]), &s[i + 1..]),
-                None => (None, s.as_str()),
-            };
-            let (address, udp) = match rest.rfind('/') {
-                Some(i) => {
-                    let proto = &rest[i + 1..];
-                    let addr = &rest[..i];
-                    match proto {
-                        "tcp" => (addr, false),
-                        "udp" => (addr, true),
-                        other => {
-                            return Err(format!("unknown protocol '{}' in '{}', expected tcp or udp", other, s));
-                        }
-                    }
-                }
-                None => (rest, false),
-            };
-            if !address.contains(':') {
-                return Err(format!("invalid proxy '{}': expected host:port", s));
-            }
-            let name = name_opt.unwrap_or("").to_string();
-            if !name.is_empty() {
-                if name.len() > 8 {
-                    return Err(format!("proxy name '{}' exceeds 8 characters", name));
-                }
-                let mut chars = name.chars();
-                let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-                if !valid {
-                    return Err(format!("proxy name '{}' is invalid: must start with a letter or '_', and contain only letters, digits, or '_'", name));
-                }
-            }
-            Ok(Proxy { name, address: address.to_string(), udp })
-        })
-        .collect()
-}
 
-async fn dispatch(conns: ConnSet, proxies: Vec<Proxy>) {
+async fn dispatch(mut acceptor: StreamAcceptor, proxies: Vec<Proxy>) -> Result<(), BoxError> {
     let map: HashMap<String, Proxy> = proxies.into_iter().map(|p| (p.name.clone(), p)).collect();
     info!(proxies = map.len(), "dispatcher started");
-    while let Some((name, tx, rx)) = conns.accept_named().await {
+    while let Some((name, tx, rx)) = acceptor.accept_named().await {
         match map.get(&name) {
             Some(proxy) => {
                 let proxy = proxy.clone();
@@ -279,78 +232,61 @@ async fn dispatch(conns: ConnSet, proxies: Vec<Proxy>) {
         }
     }
     warn!("dispatcher exited (connection set closed)");
+    Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), BoxError> {
     let level = std::env::var("RUST_LOG").ok().and_then(|s| s.parse::<Level>().ok()).unwrap_or(Level::INFO);
     tracing_subscriber::fmt().with_max_level(level).with_writer(std::io::stderr).init();
 
     let args = parse_args()?;
     let proxies = parse_proxies(&args.target)?;
 
+    let (conns, acceptor) = ConnSet::new();
+    let mut tasks: JoinSet<Result<(), BoxError>> = JoinSet::new();
+
     let server_mode = args.serve.is_some();
-    let conns = ConnSet::new();
+    let link = |addr: String| LinkConfig { addr, token: args.token.clone(), timeout: args.timeout, keep_alive: args.keep_alive };
 
-    let host_handle = args.serve.map(|addr| {
-        let token = args.token.clone();
-        let conns = conns.clone();
-        let timeout = args.timeout;
-        let keep_alive = args.keep_alive;
-        tokio::spawn(async move {
-            if let Err(e) = host(conns, addr, token, timeout, keep_alive).await {
-                warn!(error = %e, "host exited with error");
-            }
-        })
-    });
+    if let Some(addr) = args.serve.clone() {
+        tasks.spawn(host(conns.clone(), link(addr)));
+    } else if let Some(addr) = args.connect.clone() {
+        tasks.spawn(connect(conns.clone(), link(addr)));
+    }
 
-    let client_handle = args.connect.map(|addr| {
-        let token = args.token.clone();
-        let conns = conns.clone();
-        let timeout = args.timeout;
-        let keep_alive = args.keep_alive;
-        tokio::spawn(async move {
-            if let Err(e) = connect(conns, addr, token, timeout, keep_alive).await {
-                warn!(error = %e, "connect exited with error");
-            }
-        })
-    });
-
-    let proxy_handles: Vec<_> = if server_mode {
-        proxies
-            .into_iter()
-            .map(|proxy| {
-                let conns = conns.clone();
-                tokio::spawn(async move {
-                    if proxy.udp {
-                        let _ = udp::handle_entry(conns, proxy.address, proxy.name).await;
-                    } else {
-                        let _ = tcp::handle_entry(conns, proxy.address, proxy.name).await;
-                    }
-                })
-            })
-            .collect()
+    if server_mode {
+        for proxy in proxies {
+            let conns = conns.clone();
+            tasks.spawn(async move {
+                if proxy.udp {
+                    udp::handle_entry(conns, proxy.address, proxy.name).await?;
+                } else {
+                    tcp::handle_entry(conns, proxy.address, proxy.name).await?;
+                }
+                Ok::<(), BoxError>(())
+            });
+        }
     } else {
-        vec![tokio::spawn(dispatch(conns.clone(), proxies))]
-    };
+        tasks.spawn(dispatch(acceptor, proxies));
+    }
 
+    // Any task finishing (normally only on failure) ends the process; dropping the
+    // JoinSet aborts the rest. Errors are propagated so the exit code is non-zero.
     tokio::select! {
-        _ = async {
-            if let Some(handle) = host_handle {
-                let _ = handle.await;
+        res = tasks.join_next() => match res {
+            Some(Ok(Ok(()))) | None => {}
+            Some(Ok(Err(e))) => {
+                warn!(error = %e, "task exited with error");
+                return Err(e);
             }
-            if let Some(handle) = client_handle {
-                let _ = handle.await;
-            }
-        } => {}
+            Some(Err(e)) => return Err(e.into()),
+        },
         _ = tokio::signal::ctrl_c() => {
             info!("received Ctrl+C, shutting down...");
         }
     }
 
-    for handle in proxy_handles {
-        handle.abort();
-    }
-
     Ok(())
 }
+

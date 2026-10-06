@@ -31,8 +31,12 @@ async fn stream_copy(mut tx: SendStream, mut rx: RecvStream, conn: TcpStream) {
                 if let Err(e) = tx.shutdown().await {
                     debug!(peer = ?peer, error = %e, "tunnel write shutdown error");
                 }
+                Ok(())
             }
-            Err(e) => debug!(peer = ?peer, error = %e, "upstream copy error"),
+            Err(e) => {
+                debug!(peer = ?peer, error = %e, "upstream copy error");
+                Err(())
+            }
         }
     };
 
@@ -43,12 +47,18 @@ async fn stream_copy(mut tx: SendStream, mut rx: RecvStream, conn: TcpStream) {
                 if let Err(e) = wh.shutdown().await {
                     debug!(peer = ?peer, error = %e, "TCP write shutdown error");
                 }
+                Ok(())
             }
-            Err(e) => debug!(peer = ?peer, error = %e, "downstream copy error"),
+            Err(e) => {
+                debug!(peer = ?peer, error = %e, "downstream copy error");
+                Err(())
+            }
         }
     };
 
-    tokio::join!(up, down);
+    // A clean EOF in one direction only half-closes; an error in either direction
+    // cancels the other one so the connection is torn down immediately.
+    let _ = tokio::try_join!(up, down);
     debug!(peer = ?peer, "TCP stream_copy finished");
 }
 
@@ -65,6 +75,17 @@ pub async fn handle_stream(tx: SendStream, rx: RecvStream, target: String) {
     }
 }
 
+async fn open_tunnel_with_retry(conns: &ConnSet, name: &str, entry: &str, addr: std::net::SocketAddr) -> Option<(SendStream, RecvStream)> {
+    for attempt in 1..=TUNNEL_RETRY_COUNT {
+        if let Some(t) = conns.open_named(name).await {
+            return Some(t);
+        }
+        debug!(%entry, peer = %addr, attempt, "no tunnel available, retrying");
+        sleep(TUNNEL_RETRY_INTERVAL).await;
+    }
+    None
+}
+
 pub async fn handle_entry(conns: ConnSet, entry: String, name: String) -> Result<(), std::io::Error> {
     let lis = TcpListener::bind(&entry).await?;
     info!(%entry, %name, "TCP entry listening");
@@ -73,25 +94,18 @@ pub async fn handle_entry(conns: ConnSet, entry: String, name: String) -> Result
             Ok((stream, addr)) => {
                 debug!(%entry, peer = %addr, "accepted TCP connection from client");
 
-                let tunnel = {
-                    let mut result = None;
-                    for attempt in 1..=TUNNEL_RETRY_COUNT {
-                        if let Some(t) = conns.open_named(&name).await {
-                            result = Some(t);
-                            break;
-                        }
-                        debug!(%entry, peer = %addr, attempt, "no tunnel available, retrying");
-                        sleep(TUNNEL_RETRY_INTERVAL).await;
+                // Retry inside a per-connection task so a missing tunnel never blocks `accept`.
+                let conns = conns.clone();
+                let entry = entry.clone();
+                let name = name.clone();
+                tokio::spawn(async move {
+                    if let Some((tx, rx)) = open_tunnel_with_retry(&conns, &name, &entry, addr).await {
+                        debug!(%entry, peer = %addr, %name, "tunnel acquired, starting stream copy");
+                        stream_copy(tx, rx, stream).await;
+                    } else {
+                        warn!(%entry, peer = %addr, "no tunnel available after retries, dropping connection");
                     }
-                    result
-                };
-
-                if let Some((tx, rx)) = tunnel {
-                    debug!(%entry, peer = %addr, %name, "tunnel acquired, starting stream copy");
-                    tokio::spawn(stream_copy(tx, rx, stream));
-                } else {
-                    warn!(%entry, peer = %addr, "no tunnel available after retries, dropping connection");
-                }
+                });
             }
             Err(err) => {
                 use std::io::ErrorKind::*;

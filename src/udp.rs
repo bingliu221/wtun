@@ -1,115 +1,148 @@
 use std::{
     collections::HashMap,
+    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use tokio::{
     io::AsyncReadExt,
     net::{UdpSocket, lookup_host},
-    sync::{Mutex, mpsc},
+    sync::mpsc::{self, error::TrySendError},
     time::{sleep, timeout},
 };
 use tracing::{debug, info, trace, warn};
 
-use crate::{ConnSet, RecvStream, SendStream};
+use crate::{ConnSet, RecvStream, SendStream, lock};
 
 /// Idle timeout for a per-client UDP session on the server side.
 const UDP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum number of encoded frames queued towards the tunnel; extra packets are dropped (UDP semantics).
+const WRITE_QUEUE: usize = 1024;
+
+/// Receive buffer size for UDP sockets (max UDP datagram).
+const UDP_BUF_SIZE: usize = 65536;
+
 #[derive(Debug, Clone, Copy)]
 pub struct PacketParseError;
 
-pub struct Packet {
-    pub addr: SocketAddr,
-    pub payload: Vec<u8>,
+/// Returns an unspecified local [`SocketAddr`] of the same IP family as `target`,
+/// suitable for binding a UDP socket that will communicate with `target`.
+pub fn local_bind_addr(target: &SocketAddr) -> SocketAddr {
+    if target.is_ipv4() { SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into() } else { SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into() }
 }
 
-impl Packet {
-    pub fn new(addr: SocketAddr, payload: &[u8]) -> Self {
-        Self { addr, payload: payload.to_vec() }
-    }
-
-    /// Returns an unspecified local [`SocketAddr`] of the same IP family as `target`,
-    /// suitable for binding a UDP socket that will communicate with `target`.
-    pub fn local_bind_addr(target: &SocketAddr) -> SocketAddr {
-        if target.is_ipv4() {
-            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into()
-        } else {
-            SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0).into()
+/// Encode a packet into a length-prefixed wire frame using a single allocation.
+///
+/// Wire format:
+/// ```text
+/// [ u16 data_len ][ u8 family (4|6) ][ 4|16 bytes ip ][ u16 port ][ payload ]
+/// ```
+///
+/// Returns `None` if the frame would not fit in the `u16` length prefix.
+pub fn encode_frame(addr: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
+    let ip_len = if addr.is_ipv4() { 1 + 4 } else { 1 + 16 };
+    let data_len = ip_len + 2 + payload.len(); // ip + port (2 bytes) + payload
+    let prefix = u16::try_from(data_len).ok()?;
+    let mut buf = Vec::with_capacity(2 + data_len);
+    buf.extend_from_slice(&prefix.to_be_bytes());
+    match addr.ip() {
+        IpAddr::V4(ip) => {
+            buf.push(4);
+            buf.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            buf.push(6);
+            buf.extend_from_slice(&ip.octets());
         }
     }
-
-    /// Encode this packet into a length-prefixed wire frame using a single allocation.
-    ///
-    /// Wire format:
-    /// ```text
-    /// [ u16 data_len ][ u8 family (4|6) ][ 4|16 bytes ip ][ u16 port ][ payload ]
-    /// ```
-    pub fn into_framed(self) -> Vec<u8> {
-        let ip_len = if self.addr.is_ipv4() { 1 + 4 } else { 1 + 16 };
-        let data_len = ip_len + 2 + self.payload.len(); // ip + port (2 bytes) + payload
-        let mut buf = Vec::with_capacity(2 + data_len);
-        buf.extend_from_slice(&(data_len as u16).to_be_bytes()); // length prefix
-        match self.addr.ip() {
-            IpAddr::V4(ip) => {
-                buf.push(4);
-                buf.extend_from_slice(&ip.octets());
-            }
-            IpAddr::V6(ip) => {
-                buf.push(6);
-                buf.extend_from_slice(&ip.octets());
-            }
-        }
-        buf.extend_from_slice(&self.addr.port().to_be_bytes());
-        buf.extend_from_slice(&self.payload);
-        buf
-    }
+    buf.extend_from_slice(&addr.port().to_be_bytes());
+    buf.extend_from_slice(payload);
+    Some(buf)
 }
 
-impl TryFrom<&[u8]> for Packet {
-    type Error = PacketParseError;
-
-    fn try_from(buf: &[u8]) -> Result<Self, Self::Error> {
-        if buf.is_empty() {
-            return Err(PacketParseError);
+/// Parse a frame body (without the length prefix). Returns the address and the
+/// offset at which the payload starts in `buf`.
+pub fn parse_frame(buf: &[u8]) -> Result<(SocketAddr, usize), PacketParseError> {
+    match buf.first() {
+        Some(4) if buf.len() >= 7 => {
+            let ip = Ipv4Addr::new(buf[1], buf[2], buf[3], buf[4]);
+            Ok((SocketAddr::new(ip.into(), u16::from_be_bytes([buf[5], buf[6]])), 7))
         }
-
-        match buf[0] {
-            4 if buf.len() >= 7 => Ok(Packet {
-                addr: SocketAddr::new(Ipv4Addr::from(<[u8; 4]>::try_from(&buf[1..5]).unwrap()).into(), u16::from_be_bytes([buf[5], buf[6]])),
-                payload: buf[7..].to_vec(),
-            }),
-            6 if buf.len() >= 19 => Ok(Packet {
-                addr: SocketAddr::new(Ipv6Addr::from(<[u8; 16]>::try_from(&buf[1..17]).unwrap()).into(), u16::from_be_bytes([buf[17], buf[18]])),
-                payload: buf[19..].to_vec(),
-            }),
-
-            _ => Err(PacketParseError),
+        Some(6) if buf.len() >= 19 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&buf[1..17]);
+            Ok((SocketAddr::new(Ipv6Addr::from(octets).into(), u16::from_be_bytes([buf[17], buf[18]])), 19))
         }
+        _ => Err(PacketParseError),
     }
 }
 
-async fn recv_packet(rx: &mut RecvStream) -> Result<Option<Packet>, std::io::Error> {
+/// Read one frame into `buf` (reused across calls).
+///
+/// * `Err(_)` – the stream is broken/closed.
+/// * `Ok(None)` – a malformed frame was skipped; the stream is still usable.
+/// * `Ok(Some((addr, off)))` – payload is `&buf[off..]`.
+async fn recv_packet(rx: &mut RecvStream, buf: &mut Vec<u8>) -> io::Result<Option<(SocketAddr, usize)>> {
     let size = rx.read_u16().await? as usize;
-    let mut buf = vec![0u8; size];
-    match rx.read_exact(&mut buf).await {
-        Ok(_) => {
-            let pkt = Packet::try_from(&buf[..]);
-            if pkt.is_err() {
-                warn!(size, "received packet failed to parse");
-            }
-            Ok(pkt.ok())
+    buf.clear();
+    buf.resize(size, 0);
+    rx.read_exact(&mut buf[..]).await.map_err(|e| io::Error::other(e.to_string()))?;
+    match parse_frame(buf) {
+        Ok(v) => Ok(Some(v)),
+        Err(_) => {
+            warn!(size, "received packet failed to parse");
+            Ok(None)
         }
-        Err(err) => Err(std::io::Error::other(err.to_string())),
+    }
+}
+
+type SessionMap = Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>>;
+
+async fn session_task(socket: Arc<UdpSocket>, client: SocketAddr, target: SocketAddr, write_tx: mpsc::Sender<Vec<u8>>, sockets: SessionMap) {
+    let mut buf = vec![0u8; UDP_BUF_SIZE];
+    loop {
+        match timeout(UDP_SESSION_IDLE_TIMEOUT, socket.recv_from(&mut buf)).await {
+            Ok(Ok((n, remote))) => {
+                if remote != target {
+                    trace!(%client, %remote, %target, "← ignored: packet not from target");
+                    continue;
+                }
+                trace!(%client, payload_len = n, "← target: forwarding packet to tunnel");
+                let Some(frame) = encode_frame(client, &buf[..n]) else {
+                    debug!(%client, payload_len = n, "dropping oversized packet");
+                    continue;
+                };
+                match write_tx.try_send(frame) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => trace!(%client, "tunnel write queue full, dropping packet"),
+                    Err(TrySendError::Closed(_)) => break,
+                }
+            }
+            Ok(Err(e)) => {
+                warn!(%client, error = %e, "UDP recv_from error");
+                break;
+            }
+            Err(_) => {
+                debug!(%client, idle_secs = UDP_SESSION_IDLE_TIMEOUT.as_secs(), "UDP session timed out (idle)");
+                break;
+            }
+        }
+    }
+    info!(%client, "UDP session removed");
+    // Only remove our own entry: a newer session for the same client may already exist.
+    let mut map = lock(&sockets);
+    if map.get(&client).is_some_and(|s| Arc::ptr_eq(s, &socket)) {
+        map.remove(&client);
     }
 }
 
 async fn handle_target_stream(mut tx: SendStream, mut rx: RecvStream, target: SocketAddr) {
     info!(%target, "target stream started");
-    let sockets = Arc::new(Mutex::new(HashMap::<SocketAddr, Arc<UdpSocket>>::new()));
-    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let sockets: SessionMap = Default::default();
+    let (write_tx, mut write_rx) = mpsc::channel::<Vec<u8>>(WRITE_QUEUE);
 
     tokio::spawn(async move {
         while let Some(data) = write_rx.recv().await {
@@ -119,59 +152,37 @@ async fn handle_target_stream(mut tx: SendStream, mut rx: RecvStream, target: So
         }
     });
 
-    while let Ok(Some(pkt)) = recv_packet(&mut rx).await {
-        trace!(client = %pkt.addr, payload_len = pkt.payload.len(), "→ target: received packet from tunnel");
-        let socket = {
-            let mut map = sockets.lock().await;
-            if let Some(sock) = map.get(&pkt.addr) {
-                sock.clone()
-            } else {
-                let laddr = Packet::local_bind_addr(&target);
-                let sock = Arc::new(UdpSocket::bind(laddr).await.unwrap());
-                info!(client = %pkt.addr, local = ?sock.local_addr().ok(), %target, "new UDP session");
-                map.insert(pkt.addr, sock.clone());
+    let mut buf = Vec::new();
+    loop {
+        let (client, off) = match recv_packet(&mut rx, &mut buf).await {
+            Ok(Some(v)) => v,
+            Ok(None) => continue,
+            Err(_) => break,
+        };
+        let payload = &buf[off..];
+        trace!(%client, payload_len = payload.len(), "→ target: received packet from tunnel");
 
-                tokio::spawn({
-                    let addr = pkt.addr;
-                    let write_tx = write_tx.clone();
-                    let sockets = sockets.clone();
-                    let socket = sock.clone();
-                    async move {
-                        let mut buf = [0u8; 65536];
-                        loop {
-                            match timeout(UDP_SESSION_IDLE_TIMEOUT, socket.recv_from(&mut buf)).await {
-                                Ok(Ok((n, remote))) => {
-                                    if remote != target {
-                                        trace!(client = %addr, %remote, %target, "← ignored: packet not from target");
-                                        continue;
-                                    }
-                                    trace!(client = %addr, payload_len = n, "← target: forwarding packet to tunnel");
-                                    let _ = write_tx.send(Packet::new(addr, &buf[..n]).into_framed());
-                                }
-                                Ok(Err(e)) => {
-                                    warn!(client = %addr, error = %e, "UDP recv_from error");
-                                    break;
-                                }
-                                Err(_) => {
-                                    debug!(client = %addr, idle_secs = UDP_SESSION_IDLE_TIMEOUT.as_secs(), "UDP session timed out (idle)");
-                                    break;
-                                }
-                            }
-                        }
-                        info!(client = %addr, "UDP session removed");
-                        sockets.lock().await.remove(&addr);
+        let existing = lock(&sockets).get(&client).cloned();
+        let socket = match existing {
+            Some(s) => s,
+            None => {
+                let sock = match UdpSocket::bind(local_bind_addr(&target)).await {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        warn!(%client, %target, error = %e, "failed to bind UDP socket, dropping packet");
+                        continue;
                     }
-                });
-
+                };
+                info!(%client, local = ?sock.local_addr().ok(), %target, "new UDP session");
+                lock(&sockets).insert(client, sock.clone());
+                tokio::spawn(session_task(sock.clone(), client, target, write_tx.clone(), sockets.clone()));
                 sock
             }
         };
 
-        match socket.send_to(&pkt.payload, target).await {
-            Ok(n) => trace!(client = %pkt.addr, sent = n, %target, "→ target: sent packet"),
-            Err(e) => {
-                debug!(client = %pkt.addr, %target, error = %e, "failed to send UDP packet to target")
-            }
+        match socket.send_to(payload, target).await {
+            Ok(n) => trace!(%client, sent = n, %target, "→ target: sent packet"),
+            Err(e) => debug!(%client, %target, error = %e, "failed to send UDP packet to target"),
         }
     }
     info!(%target, "target stream ended");
@@ -191,7 +202,7 @@ pub async fn handle_stream(tx: SendStream, rx: RecvStream, target: String) {
     }
 }
 
-pub async fn handle_entry(conns: ConnSet, entry: String, name: String) -> Result<(), std::io::Error> {
+pub async fn handle_entry(conns: ConnSet, entry: String, name: String) -> Result<(), io::Error> {
     let socket = Arc::new(UdpSocket::bind(&entry).await?);
     info!(%entry, %name, "UDP entry listening");
     loop {
@@ -200,13 +211,18 @@ pub async fn handle_entry(conns: ConnSet, entry: String, name: String) -> Result
             let mut t1 = tokio::spawn({
                 let socket = socket.clone();
                 async move {
-                    while let Ok(Some(pkt)) = recv_packet(&mut rx).await {
-                        trace!(dst = %pkt.addr, payload_len = pkt.payload.len(), "← tunnel: forwarding packet to local");
-                        match socket.send_to(&pkt.payload, pkt.addr).await {
-                            Ok(n) => trace!(dst = %pkt.addr, sent = n, "local send ok"),
-                            Err(e) => {
-                                debug!(dst = %pkt.addr, error = %e, "failed to send to local")
-                            }
+                    let mut buf = Vec::new();
+                    loop {
+                        let (addr, off) = match recv_packet(&mut rx, &mut buf).await {
+                            Ok(Some(v)) => v,
+                            Ok(None) => continue,
+                            Err(_) => break,
+                        };
+                        let payload = &buf[off..];
+                        trace!(dst = %addr, payload_len = payload.len(), "← tunnel: forwarding packet to local");
+                        match socket.send_to(payload, addr).await {
+                            Ok(n) => trace!(dst = %addr, sent = n, "local send ok"),
+                            Err(e) => debug!(dst = %addr, error = %e, "failed to send to local"),
                         }
                     }
                     debug!("tunnel recv stream ended");
@@ -216,10 +232,13 @@ pub async fn handle_entry(conns: ConnSet, entry: String, name: String) -> Result
             let mut t2 = tokio::spawn({
                 let socket = socket.clone();
                 async move {
-                    let mut buf = [0u8; 65536];
+                    let mut buf = vec![0u8; UDP_BUF_SIZE];
                     while let Ok((n, addr)) = socket.recv_from(&mut buf).await {
                         trace!(src = %addr, payload_len = n, "→ tunnel: received packet from local");
-                        let data = Packet::new(addr, &buf[..n]).into_framed();
+                        let Some(data) = encode_frame(addr, &buf[..n]) else {
+                            debug!(src = %addr, payload_len = n, "dropping oversized packet");
+                            continue;
+                        };
                         if let Err(e) = tx.write_all(&data).await {
                             warn!(src = %addr, error = %e, "failed to write to tunnel");
                             break;
